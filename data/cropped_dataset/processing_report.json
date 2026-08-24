@@ -1,0 +1,62 @@
+{
+  "generated_at": "2026-08-24T13:41:08.313667+00:00",
+  "status": "valid",
+  "input_dataset": "C:\\Users\\alpagar\\Documents\\School\\MLResearch\\Roboflow_Cropper\\data\\downloaded_dataset",
+  "output_dataset": "C:\\Users\\alpagar\\Documents\\School\\MLResearch\\Roboflow_Cropper\\data\\cropped_dataset",
+  "zip_archive": "C:\\Users\\alpagar\\Documents\\School\\MLResearch\\Roboflow_Cropper\\data\\cropped_dataset.zip",
+  "padding": 10,
+  "totals": {
+    "cropped_images": 1,
+    "skipped_empty_images": 0,
+    "validation_errors": 0
+  },
+  "warnings": [],
+  "validation": {
+    "valid": true,
+    "error_count": 0,
+    "errors": [],
+    "warnings": [],
+    "splits": {
+      "train": {
+        "split": "train",
+        "image_count": 1,
+        "annotation_count": 2406,
+        "errors": [],
+        "warnings": [],
+        "valid": true
+      }
+    }
+  },
+  "splits": {
+    "train": {
+      "input_images": 1,
+      "output_images": 1,
+      "input_annotations": 2406,
+      "output_annotations": 2406,
+      "skipped_empty_images": [],
+      "crops": [
+        {
+          "image_id": 0,
+          "file_name": "70_Spirodela_Landoltia_late_split_jpg.rf.J0r6ErunWiBWcWwkfVVf.jpg",
+          "source_width": 3166,
+          "source_height": 3401,
+          "crop": {
+            "left": 358,
+            "top": 873,
+            "right": 2555,
+            "bottom": 3065
+          },
+          "annotation_count": 2406
+        }
+      ],
+      "validation": {
+        "split": "train",
+        "image_count": 1,
+        "annotation_count": 2406,
+        "errors": [],
+        "warnings": [],
+        "valid": true
+      }
+    }
+  }
+}
