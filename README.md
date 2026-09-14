@@ -66,6 +66,9 @@ python main.py .\data\downloaded_dataset .\data\cropped_dataset --padding 10
 
 Options:
 
+- `--crop-mode {bounds,cookie-cutter}` selects the crop representation. The
+  default `bounds` keeps the established rectangular crop behavior, filenames,
+  image formats, and annotation coordinates.
 - `--padding PIXELS` retains that many pixels around the combined annotation
   boundary. It defaults to `10`, must be an integer, and may be `0` for a tight
   crop.
@@ -111,8 +114,42 @@ them in another `cropped_dataset` directory.
   Roboflow metadata are preserved.
 - COCO image width and height are updated to match the cropped file.
 - Images without annotations are omitted and listed in the report.
-- Split names and image filenames are preserved. IDs are not renumbered.
+- Split names are preserved. Bounds mode preserves image filenames; cookie-cutter
+  mode generates PNG filenames. IDs are not renumbered.
 - Images are cropped but never resized.
+
+### Cookie-cutter mode
+
+```powershell
+python main.py INPUT_DATASET OUTPUT_DATASET --crop-mode cookie-cutter --padding 10
+```
+
+This mode produces one transparent RGBA PNG per annotated source image. All
+polygons are filled into one opaque mask, including multiple polygons per
+annotation and overlapping objects. Pixels outside that union, including gaps
+between objects and padding, are fully transparent. The combined crop rectangle
+and annotation translations are the same as in bounds mode. Padding still adds
+space around that rectangle and is clipped at source image borders.
+
+Annotations without polygons (missing, null, or empty segmentation) use their
+bounding boxes as rectangular masks. Fallback annotation IDs, counts, and an
+aggregate warning per split appear in the processing report. Polygon edges use
+Pillow's hard, inclusive rasterization without antialiasing; fallback boxes use
+floor/ceil pixel coverage with exclusive right and bottom bounds. The generated
+mask replaces any source alpha channel, making annotated regions fully opaque.
+
+PNG filenames combine the original stem with a stable SHA-256 hash of the COCO
+image ID; `images[].file_name` and report source/output mappings identify each
+result. Image and annotation IDs, areas, categories, and other metadata are
+preserved. Every source image and annotation is retained except the established
+skipping of images without annotations. Transparent PNG archives may be larger
+than the corresponding JPEG datasets.
+
+Cookie-cutter COCO files include `roboflow_cropper` metadata recording
+`crop_mode`, `padding`, `alpha_mask_representation`, and
+`fallback_annotation_ids`. Both Python entry points accept
+`crop_mode=CropMode.COOKIE_CUTTER` (import `CropMode` from `crop_dataset`);
+their default remains `CropMode.BOUNDS`.
 
 ### Validation and report
 
@@ -123,13 +160,18 @@ Packaging occurs only after all output splits pass validation. Checks include:
 - Positive bounding-box dimensions and polygon areas
 - Bounding boxes and polygon coordinates remaining within image boundaries
 - Preservation of annotation IDs for every retained source image
+- Retention of all annotated source images when a source dataset is supplied
+- Unique image filenames
+- For cookie-cutter metadata: PNG format with an alpha channel, matching fallback
+  IDs, and an exact pixel comparison against the reconstructed annotation mask
 
 Roboflow may round a boundary box up to half a pixel beyond an image edge. The
 validator accepts at most `0.51` pixels for this known representation artifact
 and records an aggregate warning in `processing_report.json`.
 
 The report includes input/output counts, skipped filenames, every crop rectangle
-and source dimension, selected padding, warnings, and full validation results.
+and source dimension, selected mode and padding, source/output filenames,
+fallback counts and IDs, warnings, and full validation results.
 If validation fails, the report is still written for diagnosis, but no ZIP is
 created.
 
@@ -151,6 +193,9 @@ python validate_dataset.py .\data\cropped_dataset `
 
 Use `--json` to print a machine-readable validation result. The validator exits
 with code `0` when valid and `1` when any error is found.
+
+Run the regression suite with `python -m pytest -q`. It covers both modes,
+mask geometry and tampering, fallback reporting, and ZIP integrity and layout.
 
 ## Uploading to Roboflow
 

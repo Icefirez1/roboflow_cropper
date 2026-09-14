@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 ANNOTATION_FILENAME = "_annotations.coco.json"
 DEFAULT_SPLITS = ("train", "valid", "val", "test")
+ALPHA_MASK_REPRESENTATION = "binary-union-pillow-v1"
+
+
+class CropMode(str, Enum):
+    BOUNDS = "bounds"
+    COOKIE_CUTTER = "cookie-cutter"
 
 
 class CropDatasetError(ValueError):
@@ -50,6 +58,8 @@ class CroppedImage:
     source_height: int
     crop: CropBounds
     annotation_count: int
+    source_file_name: str = ""
+    output_file_name: str = ""
 
 
 @dataclass
@@ -57,6 +67,12 @@ class SplitCropReport:
     split: str
     cropped_images: list[CroppedImage] = field(default_factory=list)
     skipped_empty_images: list[str] = field(default_factory=list)
+    fallback_annotation_ids: list[int | str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def fallback_count(self) -> int:
+        return len(self.fallback_annotation_ids)
 
     @property
     def cropped_count(self) -> int:
@@ -67,12 +83,17 @@ class SplitCropReport:
         return len(self.skipped_empty_images)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "fallback_count": self.fallback_count}
 
 
 @dataclass
 class DatasetCropReport:
     splits: dict[str, SplitCropReport]
+    crop_mode: CropMode = CropMode.BOUNDS
+
+    @property
+    def fallback_count(self) -> int:
+        return sum(report.fallback_count for report in self.splits.values())
 
     @property
     def cropped_count(self) -> int:
@@ -84,6 +105,8 @@ class DatasetCropReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "crop_mode": self.crop_mode.value,
+            "fallback_count": self.fallback_count,
             "cropped_count": self.cropped_count,
             "skipped_count": self.skipped_count,
             "splits": {
@@ -330,6 +353,41 @@ def translate_annotation(
     return translated
 
 
+def build_annotation_mask(
+    size: tuple[int, int], annotations: Sequence[Mapping[str, Any]]
+) -> tuple[Image.Image, list[int | str]]:
+    """Rasterize translated geometry with binary Pillow polygon edges.
+
+    Box fallback uses floor/ceil coverage with exclusive right/bottom bounds.
+    Polygon boundaries follow Pillow's inclusive polygon rasterization.
+    """
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    fallback_ids = []
+    for annotation in annotations:
+        list(_polygon_points(annotation))  # Reject malformed or unsupported masks.
+        segmentation = annotation.get("segmentation")
+        if segmentation:
+            polygons = ([segmentation] if isinstance(segmentation[0], (int, float))
+                        else segmentation)
+            for polygon in polygons:
+                draw.polygon(list(zip(polygon[0::2], polygon[1::2])), fill=255)
+        else:
+            left, top, right, bottom = _bbox_extrema(annotation)
+            draw.rectangle(
+                (math.floor(left), math.floor(top),
+                 math.ceil(right) - 1, math.ceil(bottom) - 1), fill=255,
+            )
+            fallback_ids.append(annotation.get("id", "<unknown>"))
+    return mask, fallback_ids
+
+
+def cookie_cutter_file_name(file_name: str, image_id: int | str) -> str:
+    """Keep the source stem and hash the typed COCO ID deterministically."""
+    digest = hashlib.sha256(json.dumps(image_id, ensure_ascii=True).encode("utf-8"))
+    return f"{Path(file_name).stem}_{digest.hexdigest()}.png"
+
+
 def rewrite_coco_for_crops(
     coco: Mapping[str, Any], report: SplitCropReport
 ) -> dict[str, Any]:
@@ -348,6 +406,8 @@ def rewrite_coco_for_crops(
         rewritten_image = copy.deepcopy(image_record)
         rewritten_image["width"] = cropped.crop.width
         rewritten_image["height"] = cropped.crop.height
+        if cropped.output_file_name:
+            rewritten_image["file_name"] = cropped.output_file_name
         rewritten_images.append(rewritten_image)
 
     rewritten_annotations = [
@@ -380,9 +440,11 @@ def crop_split(
     source_split: str | Path,
     output_split: str | Path,
     padding: int = 10,
+    crop_mode: CropMode = CropMode.BOUNDS,
 ) -> SplitCropReport:
     """Crop all annotated images in one Roboflow COCO split."""
 
+    crop_mode = CropMode(crop_mode)
     source_split = Path(source_split).resolve()
     output_split = Path(output_split).resolve()
     if source_split == output_split:
@@ -392,6 +454,16 @@ def crop_split(
     preflight_coco(coco)
     annotations_by_image = group_annotations_by_image(coco["annotations"])
     report = SplitCropReport(split=source_split.name)
+    output_names: set[str] = set()
+    for image_record in coco["images"]:
+        if not annotations_by_image.get(image_record["id"]):
+            continue
+        name = (cookie_cutter_file_name(image_record["file_name"], image_record["id"])
+                if crop_mode == CropMode.COOKIE_CUTTER else image_record["file_name"])
+        key = Path(name).as_posix().casefold()
+        if key in output_names:
+            raise CropDatasetError(f"Output filename collision: {name}")
+        output_names.add(key)
 
     for image_record in coco["images"]:
         image_id = image_record["id"]
@@ -405,7 +477,9 @@ def crop_split(
         if not source_image_path.is_file():
             raise CropDatasetError(f"Image file not found: {source_image_path}")
 
-        output_image_path = output_split / relative_path
+        output_name = (cookie_cutter_file_name(relative_path.as_posix(), image_id)
+                       if crop_mode == CropMode.COOKIE_CUTTER else image_record["file_name"])
+        output_image_path = output_split / output_name
         output_image_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -418,6 +492,14 @@ def crop_split(
                     padding=padding,
                 )
                 cropped_image = source_image.crop(crop.as_pillow_box())
+                if crop_mode == CropMode.COOKIE_CUTTER:
+                    cropped_image = cropped_image.convert("RGBA")
+                    mask, fallback_ids = build_annotation_mask(
+                        cropped_image.size,
+                        [translate_annotation(annotation, crop) for annotation in annotations],
+                    )
+                    cropped_image.putalpha(mask)
+                    report.fallback_annotation_ids.extend(fallback_ids)
                 cropped_image.save(output_image_path)
         except CropDatasetError:
             raise
@@ -434,10 +516,23 @@ def crop_split(
                 source_height=source_height,
                 crop=crop,
                 annotation_count=len(annotations),
+                source_file_name=image_record["file_name"],
+                output_file_name=output_name,
             )
         )
 
     rewritten_coco = rewrite_coco_for_crops(coco, report)
+    if crop_mode == CropMode.COOKIE_CUTTER:
+        rewritten_coco["roboflow_cropper"] = {
+            "crop_mode": crop_mode.value,
+            "padding": padding,
+            "alpha_mask_representation": ALPHA_MASK_REPRESENTATION,
+            "fallback_annotation_ids": report.fallback_annotation_ids,
+        }
+        if report.fallback_count:
+            report.warnings.append(
+                f"{report.split}: {report.fallback_count} annotation(s) used bounding-box fallback masks"
+            )
     write_coco(rewritten_coco, output_split / ANNOTATION_FILENAME)
     return report
 
@@ -463,9 +558,11 @@ def crop_dataset(
     source_root: str | Path,
     output_root: str | Path,
     padding: int = 10,
+    crop_mode: CropMode = CropMode.BOUNDS,
 ) -> DatasetCropReport:
     """Crop every discovered split in a Roboflow COCO dataset."""
 
+    crop_mode = CropMode(crop_mode)
     source_root = Path(source_root).resolve()
     output_root = Path(output_root).resolve()
     if source_root == output_root:
@@ -477,5 +574,6 @@ def crop_dataset(
             source_split=source_split,
             output_split=output_root / source_split.name,
             padding=padding,
+            crop_mode=crop_mode,
         )
-    return DatasetCropReport(splits=reports)
+    return DatasetCropReport(splits=reports, crop_mode=crop_mode)

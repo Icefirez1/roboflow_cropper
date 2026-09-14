@@ -13,6 +13,7 @@ from typing import Sequence
 from crop_dataset import (
     ANNOTATION_FILENAME,
     CropDatasetError,
+    CropMode,
     DatasetCropReport,
     crop_dataset,
     load_coco,
@@ -59,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PADDING,
         metavar="PIXELS",
         help=f"context to retain around annotations (default: {DEFAULT_PADDING})",
+    )
+    parser.add_argument(
+        "--crop-mode",
+        choices=[mode.value for mode in CropMode],
+        default=CropMode.BOUNDS.value,
+        help="crop rectangle or transparent annotation union (default: bounds)",
     )
     parser.add_argument(
         "--overwrite",
@@ -157,10 +164,15 @@ def build_processing_report(
             "output_annotations": len(output_coco["annotations"]),
             "skipped_empty_images": split_report.skipped_empty_images,
             "crops": split_report.to_dict()["cropped_images"],
+            "fallback_count": split_report.fallback_count,
+            "fallback_annotation_ids": split_report.fallback_annotation_ids,
+            "warnings": split_report.warnings,
             "validation": validation.to_dict() if validation is not None else None,
         }
 
     warnings = list(validation_report.warnings)
+    for split_report in crop_report.splits.values():
+        warnings.extend(split_report.warnings)
     for split_report in validation_report.splits.values():
         warnings.extend(split_report.warnings)
 
@@ -171,10 +183,12 @@ def build_processing_report(
         "output_dataset": str(output_path),
         "zip_archive": str(archive_path) if archive_path is not None else None,
         "padding": padding,
+        "crop_mode": crop_report.crop_mode.value,
         "totals": {
             "cropped_images": crop_report.cropped_count,
             "skipped_empty_images": crop_report.skipped_count,
             "validation_errors": validation_report.error_count,
+            "fallback_count": crop_report.fallback_count,
         },
         "warnings": warnings,
         "validation": validation_report.to_dict(),
@@ -203,11 +217,12 @@ def print_report(
 ) -> None:
     """Print a compact, human-readable completion summary."""
 
-    print("Cropping complete.")
+    print(f"Cropping complete (mode: {report.crop_mode.value}).")
     for split_name, split_report in report.splits.items():
         print(
             f"  {split_name}: {split_report.cropped_count} cropped, "
-            f"{split_report.skipped_count} empty images skipped"
+            f"{split_report.skipped_count} empty images skipped, "
+            f"{split_report.fallback_count} box fallbacks"
         )
     print(
         f"Total: {report.cropped_count} cropped, "
@@ -234,6 +249,7 @@ def run(args: argparse.Namespace) -> DatasetCropReport:
         source_root=input_path,
         output_root=output_path,
         padding=args.padding,
+        crop_mode=getattr(args, "crop_mode", CropMode.BOUNDS),
     )
     validation_report = validate_dataset(output_path, source_root=input_path)
     processing_report = build_processing_report(

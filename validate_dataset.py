@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from PIL import Image
 
 from crop_dataset import ANNOTATION_FILENAME, DEFAULT_SPLITS, CropDatasetError, load_coco
+from crop_dataset import ALPHA_MASK_REPRESENTATION, CropMode, build_annotation_mask
 
 
 BOUNDARY_TOLERANCE = 0.51
@@ -142,6 +143,25 @@ def validate_split(
     annotations = coco["annotations"]
     report.image_count = len(images)
     report.annotation_count = len(annotations)
+    metadata = coco.get("roboflow_cropper")
+    cookie_cutter = isinstance(metadata, dict) and metadata.get("crop_mode") == CropMode.COOKIE_CUTTER.value
+    if metadata is not None and not cookie_cutter:
+        report.errors.append("Invalid roboflow_cropper crop mode metadata")
+    if cookie_cutter:
+        padding = metadata.get("padding")
+        if isinstance(padding, bool) or not isinstance(padding, int) or padding < 0:
+            report.errors.append("Invalid cookie-cutter padding metadata")
+        if metadata.get("alpha_mask_representation") != ALPHA_MASK_REPRESENTATION:
+            report.errors.append("Unsupported cookie-cutter alpha-mask representation")
+        expected_fallback_ids = [
+            ann.get("id", "<unknown>") for ann in annotations
+            if isinstance(ann, dict) and ann.get("segmentation") in (None, [])
+        ]
+        recorded_ids = metadata.get("fallback_annotation_ids")
+        # Compare typed IDs without imposing an annotation ordering.
+        if not isinstance(recorded_ids, list) or sorted(map(json.dumps, recorded_ids)) != sorted(map(json.dumps, expected_fallback_ids)):
+            report.errors.append("Cookie-cutter fallback metadata does not match box-only annotations")
+    annotations_by_image = _annotations_by_image(coco)
 
     categories = coco.get("categories")
     if not isinstance(categories, list):
@@ -158,6 +178,7 @@ def validate_split(
 
     image_dimensions: dict[int | str, tuple[int, int]] = {}
     image_file_names: dict[int | str, str] = {}
+    seen_file_names: set[str] = set()
     for image in images:
         if not isinstance(image, dict) or "id" not in image:
             report.errors.append("Every image must be an object with an ID")
@@ -184,9 +205,23 @@ def validate_split(
 
         try:
             image_path = _safe_image_path(split_path, image.get("file_name"))
+            file_key = image_path.resolve().as_posix().casefold()
+            if file_key in seen_file_names:
+                report.errors.append(f"Image filename collision: {image.get('file_name')}")
+            seen_file_names.add(file_key)
             with Image.open(image_path) as image_file:
                 actual_size = image_file.size
                 image_file.verify()
+            if cookie_cutter:
+                with Image.open(image_path) as image_file:
+                    if image_path.suffix.lower() != ".png" or image_file.format != "PNG" or "A" not in image_file.getbands():
+                        report.errors.append(f"Cookie-cutter image {image_id} must be PNG with an alpha channel")
+                    else:
+                        expected_mask, _ = build_annotation_mask(
+                            image_file.size, annotations_by_image.get(image_id, [])
+                        )
+                        if image_file.getchannel("A").tobytes() != expected_mask.tobytes():
+                            report.errors.append(f"Image {image_id} alpha channel does not match annotation union")
             if actual_size != (width, height):
                 report.errors.append(
                     f"Image {image_id} dimensions are {actual_size[0]}x{actual_size[1]}, "
@@ -286,6 +321,9 @@ def validate_split(
             }
             source_annotations = _annotations_by_image(source_coco)
             output_annotations = _annotations_by_image(coco)
+            for image_id in source_annotations:
+                if image_id not in image_dimensions:
+                    report.errors.append(f"Annotated source image {image_id} is missing from output")
             for image_id in image_dimensions:
                 if image_id not in source_images:
                     report.errors.append(
